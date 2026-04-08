@@ -19,128 +19,111 @@ from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
 
 
-# ----------------------------
-# Logging & Env
-# ----------------------------
 try:
     google.cloud.logging.Client().setup_logging()
 except Exception:
     logging.basicConfig(level=logging.INFO)
 
-load_dotenv()
+_ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(dotenv_path=_ENV_PATH)
 
 MODEL = os.getenv("MODEL", "gemini-2.5-flash-lite")
 DB_ID = os.getenv("DB_ID", "genasdb")
-PROJECT_ID = os.getenv("PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT") or "project_not_set"
+PROJECT_ID = os.getenv("PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT") or "project_not_set"
 DATASET_NAME = os.getenv("BQ_DATASET", "marketdata")
-
-logging.info(f"Using MODEL={MODEL}, DB_ID={DB_ID}, PROJECT_ID={PROJECT_ID}, DATASET={DATASET_NAME}")
-
 BIGQUERY_MCP_URL = os.getenv("BIGQUERY_MCP_URL", "https://bigquery.googleapis.com/mcp")
 
+logging.info(f"ENV_PATH={_ENV_PATH}")
+logging.info(f"Using MODEL={MODEL}, DB_ID={DB_ID}, PROJECT_ID={PROJECT_ID}, DATASET={DATASET_NAME}, BQ_MCP_URL={BIGQUERY_MCP_URL}")
 
-# ----------------------------
-# BigQuery MCP Toolset
-# ----------------------------
-def get_bigquery_mcp_toolset() -> MCPToolset:
-    credentials, project_id = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/bigquery"]
-    )
-    # Refresh token to ensure bearer is present
-    credentials.refresh(Request())
-
-    headers = {
-        "Authorization": f"Bearer {credentials.token}",
-        "x-goog-user-project": project_id,
-    }
-
-    return MCPToolset(
-        connection_params=StreamableHTTPConnectionParams(
-            url=BIGQUERY_MCP_URL,
-            headers=headers,
-            timeout=30.0,
-            sse_read_timeout=300.0,
-        )
-    )
-
-
-try:
-    bigquery_toolset = get_bigquery_mcp_toolset()
-except Exception:
-    logging.exception("Failed to init BigQuery toolset")
-    bigquery_toolset = None
-
-
-def _list_bq_tools() -> list[str]:
-    """Return tool names exposed by MCPToolset (best-effort across versions)."""
-    if bigquery_toolset is None:
-        return []
-
-    tools_attr = getattr(bigquery_toolset, "tools", None)
-    if isinstance(tools_attr, dict):
-        return list(tools_attr.keys())
-
-    if isinstance(tools_attr, list):
-        return [getattr(t, "name", str(t)) for t in tools_attr]
-
-    list_tools = getattr(bigquery_toolset, "list_tools", None)
-    if callable(list_tools):
-        try:
-            ts = list_tools()
-            return [getattr(t, "name", str(t)) for t in ts]
-        except Exception:
-            return []
-
-    return []
-
-
-def _call_execute_sql_readonly(project_id: str, query: str):
-    """
-    Call BigQuery MCP execute_sql_readonly using multiple access patterns to handle version differences.
-    """
-    if bigquery_toolset is None:
-        raise RuntimeError("BigQuery toolset is not initialized.")
-
-    # Pattern A: get_tool("execute_sql_readonly")
-    get_tool = getattr(bigquery_toolset, "get_tool", None)
-    if callable(get_tool):
-        tool = get_tool("execute_sql_readonly")
-        return tool(projectId=project_id, query=query)
-
-    # Pattern B: tools dict-like (bigquery_toolset.tools)
-    tools_attr = getattr(bigquery_toolset, "tools", None)
-    if isinstance(tools_attr, dict) and "execute_sql_readonly" in tools_attr:
-        tool = tools_attr["execute_sql_readonly"]
-        return tool(projectId=project_id, query=query)
-
-    # Pattern C: list of tools with name attribute
-    if isinstance(tools_attr, list):
-        for t in tools_attr:
-            if getattr(t, "name", None) == "execute_sql_readonly":
-                return t(projectId=project_id, query=query)
-
-    # Pattern D: call_tool("execute_sql_readonly", args)
-    call_tool = getattr(bigquery_toolset, "call_tool", None)
-    if callable(call_tool):
-        return call_tool("execute_sql_readonly", {"projectId": project_id, "query": query})
-
-    raise RuntimeError(f"Cannot call execute_sql_readonly. Available tools: {_list_bq_tools()}")
-
-
-# ----------------------------
-# Datastore + MCP local tools (Tasks / Notes)
-# ----------------------------
 db = datastore.Client(database=DB_ID)
 mcp = FastMCP("WorkspaceTools")
+
+_bq_toolset = None
+_bq_init_error = None
 
 
 def _now():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def _ensure_bigquery_toolset():
+    global _bq_toolset, _bq_init_error
+    if _bq_toolset is not None:
+        return _bq_toolset
+    if _bq_init_error is not None:
+        return None
+
+    try:
+        credentials, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/bigquery"])
+        credentials.refresh(Request())
+        headers = {
+            "Authorization": f"Bearer {credentials.token}",
+            "x-goog-user-project": project_id,
+        }
+        _bq_toolset = MCPToolset(
+            connection_params=StreamableHTTPConnectionParams(
+                url=BIGQUERY_MCP_URL,
+                headers=headers,
+                timeout=30.0,
+                sse_read_timeout=300.0,
+            )
+        )
+        return _bq_toolset
+    except Exception as e:
+        logging.exception("Failed to init BigQuery MCP toolset")
+        _bq_init_error = str(e)
+        return None
+
+
+def _list_bq_tools():
+    ts = _ensure_bigquery_toolset()
+    if ts is None:
+        return []
+    tools_attr = getattr(ts, "tools", None)
+    if isinstance(tools_attr, dict):
+        return list(tools_attr.keys())
+    if isinstance(tools_attr, list):
+        return [getattr(t, "name", str(t)) for t in tools_attr]
+    list_tools = getattr(ts, "list_tools", None)
+    if callable(list_tools):
+        try:
+            lst = list_tools()
+            return [getattr(t, "name", str(t)) for t in lst]
+        except Exception:
+            return []
+    return []
+
+
+def _call_execute_sql_readonly(project_id: str, query: str):
+    ts = _ensure_bigquery_toolset()
+    if ts is None:
+        raise RuntimeError(f"BigQuery MCP toolset init failed: {_bq_init_error}")
+
+    get_tool = getattr(ts, "get_tool", None)
+    if callable(get_tool):
+        tool = get_tool("execute_sql_readonly")
+        return tool(projectId=project_id, query=query)
+
+    tools_attr = getattr(ts, "tools", None)
+    if isinstance(tools_attr, dict) and "execute_sql_readonly" in tools_attr:
+        tool = tools_attr["execute_sql_readonly"]
+        return tool(projectId=project_id, query=query)
+
+    if isinstance(tools_attr, list):
+        for t in tools_attr:
+            if getattr(t, "name", None) == "execute_sql_readonly":
+                return t(projectId=project_id, query=query)
+
+    call_tool = getattr(ts, "call_tool", None)
+    if callable(call_tool):
+        return call_tool("execute_sql_readonly", {"projectId": project_id, "query": query})
+
+    raise RuntimeError(f"Cannot find execute_sql_readonly. Available tools: {_list_bq_tools()}")
+
+
 @mcp.tool()
 def add_task(title: str) -> str:
-    """Add a new task."""
     try:
         key = db.key("Task")
         task = datastore.Entity(key=key)
@@ -154,14 +137,12 @@ def add_task(title: str) -> str:
 
 @mcp.tool()
 def list_tasks() -> str:
-    """List all tasks (latest first)."""
     try:
         q = db.query(kind="Task")
         q.order = ["-created_at"]
         tasks = list(q.fetch(limit=50))
         if not tasks:
             return "Your task list is empty."
-
         lines = ["📋 Current Tasks:"]
         for t in tasks:
             status = "✅" if t.get("completed") else "⏳"
@@ -174,13 +155,12 @@ def list_tasks() -> str:
 
 @mcp.tool()
 def complete_task(task_id: str) -> str:
-    """Mark a task as completed. Use the numeric ID shown in list_tasks()."""
     try:
         numeric_id = int("".join(filter(str.isdigit, task_id)))
         key = db.key("Task", numeric_id)
         task = db.get(key)
         if not task:
-            return f"Task {numeric_id} not found. Tip: run 'List my tasks' and copy the ID."
+            return f"Task {numeric_id} not found."
         task["completed"] = True
         task["completed_at"] = _now()
         db.put(task)
@@ -192,7 +172,6 @@ def complete_task(task_id: str) -> str:
 
 @mcp.tool()
 def add_note(title: str, content: str) -> str:
-    """Save a note."""
     try:
         key = db.key("Note")
         note = datastore.Entity(key=key)
@@ -206,14 +185,12 @@ def add_note(title: str, content: str) -> str:
 
 @mcp.tool()
 def list_notes(limit: int = 20) -> str:
-    """List recent notes (titles only)."""
     try:
         q = db.query(kind="Note")
         q.order = ["-created_at"]
         notes = list(q.fetch(limit=max(1, min(limit, 50))))
         if not notes:
             return "No notes yet."
-
         lines = ["🗂️ Recent Notes:"]
         for n in notes:
             lines.append(f"• {n.get('title')} (ID: {n.key.id})")
@@ -223,87 +200,57 @@ def list_notes(limit: int = 20) -> str:
         return f"Database Error: {e}"
 
 
-# ----------------------------
-# BigQuery wrapper tool (the ONLY BigQuery tool the model should call)
-# ----------------------------
 @mcp.tool()
 def bq_sql(query: str) -> str:
-    """
-    Run a read-only BigQuery SQL query via MCP and return results as text.
-    If it fails, it will return the error plus available tool names for debugging.
-    """
-    if bigquery_toolset is None:
-        return "BigQuery tool is not available (toolset init failed)."
-
     q = (query or "").strip()
     if not q:
         return "Empty SQL query."
-
     try:
         result = _call_execute_sql_readonly(PROJECT_ID, q)
         return str(result)
     except Exception as e:
         logging.exception("BigQuery query failed")
-        return f"BigQuery Error: {e}\nAvailable tools: {_list_bq_tools()}"
+        return f"BigQuery Error: {e}\nAvailable tools: {_list_bq_tools()}\nInit error: {_bq_init_error}"
 
 
-# ----------------------------
-# Wikipedia tool
-# ----------------------------
+@mcp.tool()
+def bq_diag() -> str:
+    ts = _ensure_bigquery_toolset()
+    return (
+        "BigQuery Diagnostics\n"
+        f"- PROJECT_ID={PROJECT_ID}\n"
+        f"- DATASET={DATASET_NAME}\n"
+        f"- BIGQUERY_MCP_URL={BIGQUERY_MCP_URL}\n"
+        f"- toolset_initialized={ts is not None}\n"
+        f"- init_error={_bq_init_error}\n"
+        f"- available_tools={_list_bq_tools()}\n"
+    )
+
+
 wikipedia_tool = LangchainTool(tool=WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper()))
 
-
-# ----------------------------
-# Root Agent Instruction
-# ----------------------------
 INSTRUCTION = f"""
 You are a Personal Workspace Assistant.
 
 Capabilities:
-- Tasks: add tasks, list tasks, complete tasks (persistent via Datastore)
-- Notes: save notes, list notes (persistent via Datastore)
+- Tasks: add tasks, list tasks, complete tasks
+- Notes: save notes, list notes
 - Research: Wikipedia lookup + summary
 - Dataset analytics: BigQuery (read-only SQL)
 
-STRICT Tool Calling Rules:
-- If a tool is needed, ALWAYS call the tool directly (never wrap tool calls in text).
-- NEVER use "print()", NEVER use "default_api", NEVER output "call ..." as text.
-- NEVER write code-like tool calls. Tool calls must be structured tool calls only.
-- After tool execution, summarize results in natural language.
-
-BigQuery Rules (IMPORTANT):
-- For BigQuery, ALWAYS call the tool "bq_sql" with the SQL string.
+Tool rules:
+- For BigQuery, ALWAYS call bq_sql with the SQL string.
 - Never call any other BigQuery tool directly.
-- Query ONLY project "{PROJECT_ID}" and dataset "{DATASET_NAME}".
+- If bq_sql returns an error, show the error message as-is.
+
+BigQuery constraints:
+- Use ONLY dataset `{DATASET_NAME}` in project `{PROJECT_ID}`.
 - Allowed tables:
   - `{PROJECT_ID}.{DATASET_NAME}.gold_silver_raw`
   - `{PROJECT_ID}.{DATASET_NAME}.crypto_top1000_raw`
   - `{PROJECT_ID}.{DATASET_NAME}.company_financials_raw`
-- Do NOT invent columns. If unsure, first run:
-  SELECT * FROM `{PROJECT_ID}.{DATASET_NAME}.TABLE_NAME` LIMIT 5
-- If bq_sql returns an error, show the error message as-is without rewriting it.
-
-SQL Formatting Rules:
-- Use Standard SQL.
-- Use fully-qualified table names with backticks: `{PROJECT_ID}.{DATASET_NAME}.table`
-- Keep queries small. Prefer LIMIT 10 for previews.
-
-Recommended BigQuery Queries:
-- Latest gold/silver date:
-  SELECT MAX(date) AS latest_date
-  FROM `{PROJECT_ID}.{DATASET_NAME}.gold_silver_raw`;
-
-- Top 10 crypto by marketCap:
-  SELECT name, symbol, marketCap, price, `24hVolume`, change, listedAt
-  FROM `{PROJECT_ID}.{DATASET_NAME}.crypto_top1000_raw`
-  ORDER BY marketCap DESC
-  LIMIT 10;
 """
 
-
-# ----------------------------
-# Tools list + Agent
-# ----------------------------
 tools_list = [
     add_task,
     list_tasks,
@@ -312,6 +259,7 @@ tools_list = [
     list_notes,
     wikipedia_tool,
     bq_sql,
+    bq_diag,
 ]
 
 root_agent = Agent(
