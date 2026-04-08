@@ -45,10 +45,9 @@ Create a .env file in the project root:
 ```bash
 PROJECT_ID=
 SERVICE_ACCOUNT=
-
 MODEL=gemini-2.5-flash-lite
 DB_ID=
-
+BQ_DATASET=
 GOOGLE_GENAI_USE_VERTEXAI=True
 GOOGLE_API_KEY=""
 ```

@@ -1,12 +1,13 @@
 import os
+import re
+import json
 import logging
 import datetime
-
 import google.cloud.logging
-import google.auth
-from google.auth.transport.requests import Request
-from google.cloud import datastore
+
 from dotenv import load_dotenv
+from google.cloud import datastore
+from google.cloud import bigquery
 
 from mcp.server.fastmcp import FastMCP
 from google.adk import Agent
@@ -15,111 +16,62 @@ from google.adk.tools.langchain_tool import LangchainTool
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 
-from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset
-from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnectionParams
-
 
 try:
     google.cloud.logging.Client().setup_logging()
 except Exception:
     logging.basicConfig(level=logging.INFO)
 
-_ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
-load_dotenv(dotenv_path=_ENV_PATH)
+load_dotenv()
 
 MODEL = os.getenv("MODEL", "gemini-2.5-flash-lite")
 DB_ID = os.getenv("DB_ID", "genasdb")
-PROJECT_ID = os.getenv("PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCLOUD_PROJECT") or "project_not_set"
-DATASET_NAME = os.getenv("BQ_DATASET", "marketdata")
-BIGQUERY_MCP_URL = os.getenv("BIGQUERY_MCP_URL", "https://bigquery.googleapis.com/mcp")
+PROJECT_ID = os.getenv("PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT") or ""
+BQ_DATASET = os.getenv("BQ_DATASET", "marketdata")
 
-logging.info(f"ENV_PATH={_ENV_PATH}")
-logging.info(f"Using MODEL={MODEL}, DB_ID={DB_ID}, PROJECT_ID={PROJECT_ID}, DATASET={DATASET_NAME}, BQ_MCP_URL={BIGQUERY_MCP_URL}")
+if not PROJECT_ID:
+    PROJECT_ID = "project_not_set"
+
+logging.info(f"MODEL={MODEL} DB_ID={DB_ID} PROJECT_ID={PROJECT_ID} BQ_DATASET={BQ_DATASET}")
 
 db = datastore.Client(database=DB_ID)
-mcp = FastMCP("WorkspaceTools")
+bq = bigquery.Client(project=PROJECT_ID)
 
-_bq_toolset = None
-_bq_init_error = None
+mcp = FastMCP("WorkspaceTools")
 
 
 def _now():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def _ensure_bigquery_toolset():
-    global _bq_toolset, _bq_init_error
-    if _bq_toolset is not None:
-        return _bq_toolset
-    if _bq_init_error is not None:
-        return None
-
-    try:
-        credentials, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/bigquery"])
-        credentials.refresh(Request())
-        headers = {
-            "Authorization": f"Bearer {credentials.token}",
-            "x-goog-user-project": project_id,
-        }
-        _bq_toolset = MCPToolset(
-            connection_params=StreamableHTTPConnectionParams(
-                url=BIGQUERY_MCP_URL,
-                headers=headers,
-                timeout=30.0,
-                sse_read_timeout=300.0,
-            )
-        )
-        return _bq_toolset
-    except Exception as e:
-        logging.exception("Failed to init BigQuery MCP toolset")
-        _bq_init_error = str(e)
-        return None
+def _is_safe_readonly_sql(sql: str) -> bool:
+    s = sql.strip().lower()
+    if not s.startswith("select") and not s.startswith("with"):
+        return False
+    forbidden = ["insert", "update", "delete", "merge", "drop", "alter", "create", "grant", "revoke"]
+    return not any(word in s for word in forbidden)
 
 
-def _list_bq_tools():
-    ts = _ensure_bigquery_toolset()
-    if ts is None:
-        return []
-    tools_attr = getattr(ts, "tools", None)
-    if isinstance(tools_attr, dict):
-        return list(tools_attr.keys())
-    if isinstance(tools_attr, list):
-        return [getattr(t, "name", str(t)) for t in tools_attr]
-    list_tools = getattr(ts, "list_tools", None)
-    if callable(list_tools):
-        try:
-            lst = list_tools()
-            return [getattr(t, "name", str(t)) for t in lst]
-        except Exception:
-            return []
-    return []
-
-
-def _call_execute_sql_readonly(project_id: str, query: str):
-    ts = _ensure_bigquery_toolset()
-    if ts is None:
-        raise RuntimeError(f"BigQuery MCP toolset init failed: {_bq_init_error}")
-
-    get_tool = getattr(ts, "get_tool", None)
-    if callable(get_tool):
-        tool = get_tool("execute_sql_readonly")
-        return tool(projectId=project_id, query=query)
-
-    tools_attr = getattr(ts, "tools", None)
-    if isinstance(tools_attr, dict) and "execute_sql_readonly" in tools_attr:
-        tool = tools_attr["execute_sql_readonly"]
-        return tool(projectId=project_id, query=query)
-
-    if isinstance(tools_attr, list):
-        for t in tools_attr:
-            if getattr(t, "name", None) == "execute_sql_readonly":
-                return t(projectId=project_id, query=query)
-
-    call_tool = getattr(ts, "call_tool", None)
-    if callable(call_tool):
-        return call_tool("execute_sql_readonly", {"projectId": project_id, "query": query})
-
-    raise RuntimeError(f"Cannot find execute_sql_readonly. Available tools: {_list_bq_tools()}")
+def _render_rows(rows, max_rows: int = 20) -> str:
+    rows = list(rows)
+    if not rows:
+        return "No rows returned."
+    rows = rows[:max_rows]
+    cols = list(rows[0].keys())
+    lines = []
+    lines.append("| " + " | ".join(cols) + " |")
+    lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
+    for r in rows:
+        vals = []
+        for c in cols:
+            v = r.get(c)
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v, ensure_ascii=False)
+            vals.append(str(v))
+        lines.append("| " + " | ".join(vals) + " |")
+    if len(rows) == max_rows:
+        lines.append(f"\n(Showing first {max_rows} rows.)")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -129,27 +81,27 @@ def add_task(title: str) -> str:
         task = datastore.Entity(key=key)
         task.update({"title": title, "completed": False, "created_at": _now()})
         db.put(task)
-        return f"✅ Task created: '{title}' (ID: {task.key.id})"
+        return f"Task created: '{title}' (ID: {task.key.id})"
     except Exception as e:
-        logging.exception("DB Error in add_task")
+        logging.exception("add_task failed")
         return f"Database Error: {e}"
 
 
 @mcp.tool()
-def list_tasks() -> str:
+def list_tasks(limit: int = 50) -> str:
     try:
         q = db.query(kind="Task")
         q.order = ["-created_at"]
-        tasks = list(q.fetch(limit=50))
+        tasks = list(q.fetch(limit=max(1, min(limit, 100))))
         if not tasks:
             return "Your task list is empty."
-        lines = ["📋 Current Tasks:"]
+        lines = ["Here are your current tasks:"]
         for t in tasks:
-            status = "✅" if t.get("completed") else "⏳"
-            lines.append(f"{status} {t.get('title')} (ID: {t.key.id})")
+            status = "done" if t.get("completed") else "todo"
+            lines.append(f"- [{status}] {t.get('title')} (ID: {t.key.id})")
         return "\n".join(lines)
     except Exception as e:
-        logging.exception("DB Error in list_tasks")
+        logging.exception("list_tasks failed")
         return f"Database Error: {e}"
 
 
@@ -164,9 +116,9 @@ def complete_task(task_id: str) -> str:
         task["completed"] = True
         task["completed_at"] = _now()
         db.put(task)
-        return f"✅ Task {numeric_id} marked as done."
+        return f"Task {numeric_id} marked as done."
     except Exception as e:
-        logging.exception("Error in complete_task")
+        logging.exception("complete_task failed")
         return f"Error: {e}"
 
 
@@ -177,9 +129,9 @@ def add_note(title: str, content: str) -> str:
         note = datastore.Entity(key=key)
         note.update({"title": title, "content": content, "created_at": _now()})
         db.put(note)
-        return f"📝 Note '{title}' saved successfully."
+        return f"Note '{title}' saved successfully."
     except Exception as e:
-        logging.exception("DB Error in add_note")
+        logging.exception("add_note failed")
         return f"Database Error: {e}"
 
 
@@ -191,40 +143,40 @@ def list_notes(limit: int = 20) -> str:
         notes = list(q.fetch(limit=max(1, min(limit, 50))))
         if not notes:
             return "No notes yet."
-        lines = ["🗂️ Recent Notes:"]
+        lines = ["Recent notes:"]
         for n in notes:
-            lines.append(f"• {n.get('title')} (ID: {n.key.id})")
+            lines.append(f"- {n.get('title')} (ID: {n.key.id})")
         return "\n".join(lines)
     except Exception as e:
-        logging.exception("DB Error in list_notes")
+        logging.exception("list_notes failed")
         return f"Database Error: {e}"
 
 
 @mcp.tool()
-def bq_sql(query: str) -> str:
-    q = (query or "").strip()
-    if not q:
-        return "Empty SQL query."
+def bq_diag() -> str:
     try:
-        result = _call_execute_sql_readonly(PROJECT_ID, q)
-        return str(result)
+        ds = f"{PROJECT_ID}.{BQ_DATASET}"
+        tables = list(bq.list_tables(ds))
+        names = [t.table_id for t in tables]
+        return f"BigQuery OK. Dataset={ds}. Tables={names}"
     except Exception as e:
-        logging.exception("BigQuery query failed")
-        return f"BigQuery Error: {e}\nAvailable tools: {_list_bq_tools()}\nInit error: {_bq_init_error}"
+        logging.exception("bq_diag failed")
+        return f"BigQuery Error: {e}"
 
 
 @mcp.tool()
-def bq_diag() -> str:
-    ts = _ensure_bigquery_toolset()
-    return (
-        "BigQuery Diagnostics\n"
-        f"- PROJECT_ID={PROJECT_ID}\n"
-        f"- DATASET={DATASET_NAME}\n"
-        f"- BIGQUERY_MCP_URL={BIGQUERY_MCP_URL}\n"
-        f"- toolset_initialized={ts is not None}\n"
-        f"- init_error={_bq_init_error}\n"
-        f"- available_tools={_list_bq_tools()}\n"
-    )
+def bq_sql(query: str) -> str:
+    try:
+        if not PROJECT_ID or PROJECT_ID == "project_not_set":
+            return "BigQuery is not configured: PROJECT_ID is missing."
+        if not _is_safe_readonly_sql(query):
+            return "Only read-only SELECT/WITH queries are allowed."
+        job = bq.query(query)
+        rows = list(job.result())
+        return _render_rows(rows, max_rows=20)
+    except Exception as e:
+        logging.exception("bq_sql failed")
+        return f"BigQuery Error: {e}"
 
 
 wikipedia_tool = LangchainTool(tool=WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper()))
@@ -232,39 +184,39 @@ wikipedia_tool = LangchainTool(tool=WikipediaQueryRun(api_wrapper=WikipediaAPIWr
 INSTRUCTION = f"""
 You are a Personal Workspace Assistant.
 
-Capabilities:
-- Tasks: add tasks, list tasks, complete tasks
-- Notes: save notes, list notes
-- Research: Wikipedia lookup + summary
-- Dataset analytics: BigQuery (read-only SQL)
+You can:
+- Manage tasks (add_task, list_tasks, complete_task)
+- Manage notes (add_note, list_notes)
+- Use Wikipedia (wikipedia) for quick facts
+- Query BigQuery (bq_sql) for dataset analytics
 
-Tool rules:
-- For BigQuery, ALWAYS call bq_sql with the SQL string.
-- Never call any other BigQuery tool directly.
-- If bq_sql returns an error, show the error message as-is.
+Tool usage rules:
+- If a tool is needed, call the tool directly by name.
+- Never write tool calls as code. No "print()", no "default_api", no pseudo-Python.
+- After a tool returns, summarize the result briefly in natural language.
 
-BigQuery constraints:
-- Use ONLY dataset `{DATASET_NAME}` in project `{PROJECT_ID}`.
+BigQuery rules:
+- Dataset: `{PROJECT_ID}.{BQ_DATASET}`
 - Allowed tables:
-  - `{PROJECT_ID}.{DATASET_NAME}.gold_silver_raw`
-  - `{PROJECT_ID}.{DATASET_NAME}.crypto_top1000_raw`
-  - `{PROJECT_ID}.{DATASET_NAME}.company_financials_raw`
+  - `{PROJECT_ID}.{BQ_DATASET}.gold_silver_raw`
+  - `{PROJECT_ID}.{BQ_DATASET}.crypto_top1000_raw`
+  - `{PROJECT_ID}.{BQ_DATASET}.company_financials_raw`
+- If unsure about columns, first do:
+  SELECT * FROM `{PROJECT_ID}.{BQ_DATASET}.table_name` LIMIT 5
 """
-
-tools_list = [
-    add_task,
-    list_tasks,
-    complete_task,
-    add_note,
-    list_notes,
-    wikipedia_tool,
-    bq_sql,
-    bq_diag,
-]
 
 root_agent = Agent(
     name="root_agent",
     model=MODEL,
     instruction=INSTRUCTION,
-    tools=tools_list,
+    tools=[
+        add_task,
+        list_tasks,
+        complete_task,
+        add_note,
+        list_notes,
+        wikipedia_tool,
+        bq_diag,
+        bq_sql,
+    ],
 )
