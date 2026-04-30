@@ -104,6 +104,11 @@ adk deploy cloud_run \
 * Add sub-agents (specialists) coordinated by a primary agent
 * Add new datasets/tables and analysis prompts
 
+## Demo
+[▶ Watch Demo on YouTube](https://youtu.be/H7aYrHqxsvw)
+
+[![Demo Video](https://img.youtube.com/vi/H7aYrHqxsvw/0.jpg)](https://youtu.be/H7aYrHqxsvw)
+
 ## Contributing
 Pull requests are welcome. For major changes, open an issue first.
 
