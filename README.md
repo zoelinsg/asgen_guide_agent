@@ -108,9 +108,3 @@ adk deploy cloud_run \
 [▶ Watch Demo on YouTube](https://youtu.be/H7aYrHqxsvw)
 
 [![Demo Video](https://img.youtube.com/vi/H7aYrHqxsvw/0.jpg)](https://youtu.be/H7aYrHqxsvw)
-
-## Contributing
-Pull requests are welcome. For major changes, open an issue first.
-
-## License
-MIT
